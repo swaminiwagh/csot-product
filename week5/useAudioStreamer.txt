@@ -1,0 +1,120 @@
+import { useState, useRef, useCallback } from 'react';
+
+export function useAudioStreamer(webSocketRef) {
+  const [isRecording, setIsRecording] = useState(false);
+  const audioContextRef = useRef(null);
+  const streamRef = useRef(null);
+  const processorRef = useRef(null);
+  
+  // A separate context for playback because Gemini outputs at 24kHz
+  const playbackContextRef = useRef(null);
+  const nextPlayTimeRef = useRef(0);
+
+  // Initialize contexts safely (browsers require user interaction first)
+  const initAudio = useCallback(() => {
+    if (!audioContextRef.current) {
+      // Input context forced to 16kHz (Gemini requirement)
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      audioContextRef.current = new AudioContext({ sampleRate: 16000 });
+      // Output context set to 24kHz (Gemini response format)
+      playbackContextRef.current = new AudioContext({ sampleRate: 24000 });
+    }
+  }, []);
+
+  const startRecording = useCallback(async () => {
+    initAudio();
+    try {
+      // Request mic permissions
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      await audioContextRef.current.resume();
+
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      // Deprecated but most reliable cross-browser way to grab raw PCM data without complex AudioWorklets
+      const processor = audioContextRef.current.createScriptProcessor(4096, 1, 1);
+
+      processor.onaudioprocess = (e) => {
+        const inputData = e.inputBuffer.getChannelData(0);
+        
+        // Convert Float32 audio to Int16 PCM (Required by Gemini)
+        const pcm16 = new Int16Array(inputData.length);
+        for (let i = 0; i < inputData.length; i++) {
+          let s = Math.max(-1, Math.min(1, inputData[i]));
+          pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+        }
+
+        // Convert PCM Int16 to Base64
+        const base64Chunk = btoa(String.fromCharCode(...new Uint8Array(pcm16.buffer)));
+        
+        // Send to WebSocket (Your Python Proxy Server)
+        if (webSocketRef.current?.readyState === WebSocket.OPEN) {
+          webSocketRef.current.send(JSON.stringify({
+            realtimeInput: {
+              mediaChunks: [{
+                mimeType: "audio/pcm;rate=16000",
+                data: base64Chunk
+              }]
+            }
+          }));
+        }
+      };
+
+      source.connect(processor);
+      processor.connect(audioContextRef.current.destination);
+      processorRef.current = processor;
+      setIsRecording(true);
+
+    } catch (err) {
+      console.error("Microphone access denied or error:", err);
+    }
+  }, [webSocketRef, initAudio]);
+
+  const stopRecording = useCallback(() => {
+    if (processorRef.current) {
+      processorRef.current.disconnect();
+      processorRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+    setIsRecording(false);
+  }, []);
+
+  // Method to play incoming base64 audio chunks from Gemini
+  const playAudioChunk = useCallback((base64Audio) => {
+    initAudio();
+    
+    // Decode base64 to raw bytes
+    const binaryString = atob(base64Audio);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+
+    // Convert Int16 bytes back to Float32 for browser playback
+    const pcm16 = new Int16Array(bytes.buffer);
+    const float32 = new Float32Array(pcm16.length);
+    for (let i = 0; i < pcm16.length; i++) {
+      float32[i] = pcm16[i] / 32768.0;
+    }
+
+    // Queue the audio buffer for smooth playback
+    const audioBuffer = playbackContextRef.current.createBuffer(1, float32.length, 24000);
+    audioBuffer.getChannelData(0).set(float32);
+
+    const source = playbackContextRef.current.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(playbackContextRef.current.destination);
+
+    // Schedule playback seamlessly avoiding gaps
+    const currentTime = playbackContextRef.current.currentTime;
+    if (nextPlayTimeRef.current < currentTime) {
+      nextPlayTimeRef.current = currentTime;
+    }
+    source.start(nextPlayTimeRef.current);
+    nextPlayTimeRef.current += audioBuffer.duration;
+  }, [initAudio]);
+
+  return { isRecording, startRecording, stopRecording, playAudioChunk };
+}
