@@ -4,7 +4,7 @@
 https://github.com/swaminiwagh/csot-product
 
 ## Demo Video
-(add your screen recording link here)
+(https://drive.google.com/drive/folders/1udexmfS9e3x7we_ShqUEX7KDgnjA3HOH?usp=sharing)
 
 ---
 
